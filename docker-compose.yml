@@ -1,0 +1,145 @@
+services:
+  # ═══════════════════════════════════════════════════════════════
+  # FastAPI Application (4 workers via uvicorn)
+  # ═══════════════════════════════════════════════════════════════
+  app:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: payment-gateway-app
+    restart: unless-stopped
+    environment:
+      APP_NAME: payment-gateway
+      DEBUG: "false"
+      LOG_LEVEL: INFO
+      DATABASE_URL: postgresql+asyncpg://postgres:postgres@postgres:5432/payment_gateway
+      REDIS_URL: redis://redis:6379/0
+      REDIS_LOCK_TTL_MS: "30000"
+      REDIS_CACHE_TTL_S: "86400"
+      API_KEYS: '["dev-key-change-in-prod"]'
+    ports:
+      - "8000:8000"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+      start_period: 20s
+    networks:
+      - gateway-net
+    volumes:
+      - ./app:/app/app:ro   # hot-reload in dev (remove in prod)
+
+  # ═══════════════════════════════════════════════════════════════
+  # PostgreSQL 16
+  # ═══════════════════════════════════════════════════════════════
+  postgres:
+    image: postgres:16-alpine
+    container_name: payment-gateway-postgres
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: postgres
+      POSTGRES_DB: payment_gateway
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+      - ./migrations/initial_schema.sql:/docker-entrypoint-initdb.d/01_schema.sql:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres -d payment_gateway"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    networks:
+      - gateway-net
+    command: >
+      postgres
+        -c max_connections=200
+        -c shared_buffers=256MB
+        -c effective_cache_size=768MB
+        -c wal_level=replica
+        -c log_min_duration_statement=100
+
+  # ═══════════════════════════════════════════════════════════════
+  # Redis 7 (with persistence via AOF)
+  # ═══════════════════════════════════════════════════════════════
+  redis:
+    image: redis:7-alpine
+    container_name: payment-gateway-redis
+    restart: unless-stopped
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis_data:/data
+    command: >
+      redis-server
+        --appendonly yes
+        --appendfsync everysec
+        --maxmemory 256mb
+        --maxmemory-policy allkeys-lru
+        --save 60 1
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 3s
+      retries: 5
+    networks:
+      - gateway-net
+
+  # ═══════════════════════════════════════════════════════════════
+  # Nginx reverse proxy (rate limiting + TLS termination in prod)
+  # ═══════════════════════════════════════════════════════════════
+  nginx:
+    image: nginx:1.27-alpine
+    container_name: payment-gateway-nginx
+    restart: unless-stopped
+    ports:
+      - "80:80"
+    volumes:
+      - ./nginx/nginx.conf:/etc/nginx/nginx.conf:ro
+    depends_on:
+      app:
+        condition: service_healthy
+    networks:
+      - gateway-net
+
+  # ═══════════════════════════════════════════════════════════════
+  # pgAdmin (local dev only — remove in production)
+  # ═══════════════════════════════════════════════════════════════
+  pgadmin:
+    image: dpage/pgadmin4:latest
+    container_name: payment-gateway-pgadmin
+    restart: unless-stopped
+    environment:
+      PGADMIN_DEFAULT_EMAIL: admin@local.dev
+      PGADMIN_DEFAULT_PASSWORD: admin
+    ports:
+      - "5050:80"
+    depends_on:
+      - postgres
+    networks:
+      - gateway-net
+    profiles:
+      - dev   # only starts with: docker compose --profile dev up
+
+# ═══════════════════════════════════════════════════════════════
+# Volumes (named, so data survives container restarts)
+# ═══════════════════════════════════════════════════════════════
+volumes:
+  postgres_data:
+    driver: local
+  redis_data:
+    driver: local
+
+# ═══════════════════════════════════════════════════════════════
+# Networks
+# ═══════════════════════════════════════════════════════════════
+networks:
+  gateway-net:
+    driver: bridge
